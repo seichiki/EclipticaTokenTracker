@@ -82,52 +82,60 @@ class TokenTracker:
         self.total_tokens = 0
         self.pending_spawn_count = 0
         self.in_stage = False
-        self.waiting_for_boss_defeat = False
-        self.boss_defeated_in_stage = False
-        self.boss_fought_in_stage = False  # 同一ステージ内でのボス出現カウント済みフラグ
-        self.history_logs = []  # 内部保持用 (最大20件固定)
+        self.boss_fought_in_stage = False  # 各ステージ1回のみの判定用
+        self.is_final_boss = False
+        self.history_logs = []
         self.max_history_count = max_history_count
 
     def get_formatted_history(self) -> str:
-        """表示設定件数分だけ最新ログを取り出して改行区切りで返す"""
         display_logs = self.history_logs[-self.max_history_count :]
         return "\n".join(display_logs)
 
     def set_max_history_count(self, count: int) -> str:
-        """表示件数を変更し、即座に画面描画用のテキストを返す"""
         self.max_history_count = count
         return self.get_formatted_history()
 
     def add_history(self, log_time: str, text: str):
         self.history_logs.append(f"{log_time} {text}")
-        # 内部ログは設定件数に関わらず最大20件まで保持
         if len(self.history_logs) > 20:
             self.history_logs.pop(0)
 
-    def parse_line(self, line: str) -> tuple[str, str] | None:
+    def parse_line(self, line: str) -> tuple[str, str, bool] | None:
         log_time = extract_time(line)
 
-        # 1. トークン生成ログの検知
-        if "spawn token, False, 0" in line:
+        # 1. ラスボスステージ突入の検知
+        if "ECLIPTICA - now in stage: Stage_Bringer on phase: 1" in line:
+            self.is_final_boss = True
+            self.in_stage = False
+            self.add_history(log_time, "now in Stage_Bringer: DONE")
+            return "tokens: DONE\nGOOD LUCK", self.get_formatted_history(), True
+
+        # 2. トークン生成ログの検知
+        if "spawn token" in line:
+            if self.is_final_boss:
+                self.is_final_boss = False  # ラスボスモード解除
+
             self.pending_spawn_count += 1
             self.add_history(log_time, "spawn token: total+1")
             token_text = f"tokens: {self.collected_tokens}/{self.total_tokens}"
-            return token_text, self.get_formatted_history()
+            return token_text, self.get_formatted_history(), False
 
-        # 2. ステージ移行ログの検知
+        # ラスボス戦中は計算スキップ
+        if self.is_final_boss:
+            return None
+
+        # 3. 通常ステージ移行ログの検知
         if "now in stage:" in line:
             self.total_tokens = self.pending_spawn_count
             self.collected_tokens = 0
             self.pending_spawn_count = 0
             self.in_stage = True
-            self.waiting_for_boss_defeat = False
-            self.boss_defeated_in_stage = False
-            self.boss_fought_in_stage = False  # ボス出現フラグリセット
+            self.boss_fought_in_stage = False
             self.add_history(log_time, "now in stage: reset tokens")
             token_text = f"tokens: {self.collected_tokens}/{self.total_tokens}"
-            return token_text, self.get_formatted_history()
+            return token_text, self.get_formatted_history(), False
 
-        # 3. トークン取得（セッション保存）の検知
+        # 4. トークン取得（セッション保存）の検知
         if "ECLIPTICA saving SESSION ID" in line:
             if self.in_stage:
                 self.collected_tokens += 1
@@ -135,53 +143,36 @@ class TokenTracker:
                 token_text = (
                     f"tokens: {self.collected_tokens}/{self.total_tokens}"
                 )
-                return token_text, self.get_formatted_history()
+                return token_text, self.get_formatted_history(), False
             return None
 
-        # 4. ボス出現時のカウントダウン & 撃破監視開始 (各ステージ1回のみ)
+        # 5. ボス戦突入時の相殺処理 (-1)
         if "now fighting boss" in line:
             if not self.boss_fought_in_stage:
                 self.boss_fought_in_stage = True
-                self.waiting_for_boss_defeat = True
                 self.collected_tokens -= 1
                 self.add_history(log_time, "now fighting boss: tokens-1")
                 token_text = (
                     f"tokens: {self.collected_tokens}/{self.total_tokens}"
                 )
-                return token_text, self.get_formatted_history()
+                return token_text, self.get_formatted_history(), False
             return None
 
-        # 5. ボス撃破時のカウントダウン (ボス戦中 かつ 各ステージ1回のみ)
-        if "Tracking boss as defeated in-run." in line:
-            if self.waiting_for_boss_defeat and not self.boss_defeated_in_stage:
-                self.boss_defeated_in_stage = True
-                self.waiting_for_boss_defeat = False
-                self.collected_tokens -= 1
-                self.add_history(
-                    log_time,
-                    "Tracking boss as defeated in-run.(1): tokens-1",
-                )
-                token_text = (
-                    f"tokens: {self.collected_tokens}/{self.total_tokens}"
-                )
-                return token_text, self.get_formatted_history()
-            return None
-
-        # 6. インターミッション突入時のカウントダウン
+        # 6. インターミッション突入時の相殺処理 (-2)
         if "now in intermission" in line:
             self.in_stage = False
-            self.waiting_for_boss_defeat = False
-            self.collected_tokens -= 1
-            self.add_history(log_time, "now in intermission: tokens-1")
+            self.collected_tokens -= 2
+            self.add_history(log_time, "now in intermission: tokens-2")
             token_text = f"tokens: {self.collected_tokens}/{self.total_tokens}"
-            return token_text, self.get_formatted_history()
+            return token_text, self.get_formatted_history(), False
 
         return None
 
 
 # --- 3. ログ監視スレッド ---
 class LogMonitorThread(QThread):
-    display_update_signal = pyqtSignal(str, str)
+    # 3つ目の引数(bool)として is_final_boss を追加
+    display_update_signal = pyqtSignal(str, str, bool)
 
     def __init__(self, log_path, max_history_count):
         super().__init__()
@@ -190,7 +181,6 @@ class LogMonitorThread(QThread):
         self.tracker = TokenTracker(max_history_count)
 
     def update_max_history(self, count: int) -> str:
-        """設定変更時に呼び出し、即座に適用後の履歴テキストを取得する"""
         return self.tracker.set_max_history_count(count)
 
     def run(self):
@@ -202,9 +192,9 @@ class LogMonitorThread(QThread):
                 if line:
                     result = self.tracker.parse_line(line.strip())
                     if result:
-                        token_text, history_text = result
+                        token_text, history_text, is_final_boss = result
                         self.display_update_signal.emit(
-                            token_text, history_text
+                            token_text, history_text, is_final_boss
                         )
                 else:
                     self.msleep(100)
@@ -325,15 +315,22 @@ class TokenOverlayWindow(QWidget):
 
         self.adjust_position()
 
-    def update_token_label(self, token_text: str, history_text: str):
+    def update_token_label(
+        self, token_text: str, history_text: str, is_final_boss: bool
+    ):
         self.latest_history_text = history_text
         self.token_label.setText(token_text)
 
-        if self.config.get("show_history", True) and history_text:
-            self.history_label.setText(history_text)
-            self.history_label.setVisible(True)
-        else:
+        # ラスボス戦中の場合は強制的にレシートを非表示
+        if is_final_boss:
             self.history_label.setVisible(False)
+        else:
+            # 通常時はユーザーの設定（show_history）に従って表示
+            if self.config.get("show_history", True) and history_text:
+                self.history_label.setText(history_text)
+                self.history_label.setVisible(True)
+            else:
+                self.history_label.setVisible(False)
 
         self.adjust_position()
 
